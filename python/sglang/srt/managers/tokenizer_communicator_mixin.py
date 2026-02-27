@@ -855,6 +855,7 @@ class TokenizerCommunicatorMixin:
         await self.slow_down_communicator(obj)
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
@@ -865,6 +866,7 @@ class TokenizerCommunicatorMixin:
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
+        self.auto_create_handle_loop()
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
@@ -873,9 +875,11 @@ class TokenizerCommunicatorMixin:
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput
     ) -> List[DumperControlReqOutput]:
+        self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
 
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
+        self.auto_create_handle_loop()
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
 
@@ -894,6 +898,7 @@ class TokenizerCommunicatorMixin:
         Returns:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
+        self.auto_create_handle_loop()
         req = GetLoadsReqInput(
             include=include if include else ["all"],
             dp_rank=dp_rank,
