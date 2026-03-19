@@ -179,10 +179,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
         mamba_size: int = None,
-    ):
-        if mamba_size is not None:
-            pre_alloc_size = min(pre_alloc_size, max(0, mamba_size - size))
-            
+    ):   
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
@@ -195,9 +192,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        effective_mamba_size = (
-            mamba_size if mamba_size is not None else size + pre_alloc_size
-        )
+        if mamba_size is not None:
+            effective_mamba_size = mamba_size
+        else:
+            effective_mamba_size = size + pre_alloc_size
         self._init_mamba_pool(
             size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
