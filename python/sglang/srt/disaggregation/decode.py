@@ -179,7 +179,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
         mamba_size: int = None,
-    ):   
+    ):
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
