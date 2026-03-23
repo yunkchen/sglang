@@ -193,7 +193,15 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         if mamba_size is not None:
-            effective_mamba_size = mamba_size
+            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
+            if mamba_size > size + pre_alloc_size:
+                logger.warning(
+                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
+                    "capping effective_mamba_size to %d",
+                    mamba_size,
+                    size + pre_alloc_size,
+                    effective_mamba_size,
+                )
         else:
             effective_mamba_size = size + pre_alloc_size
         self._init_mamba_pool(
