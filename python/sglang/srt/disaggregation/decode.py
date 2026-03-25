@@ -204,6 +204,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                 )
         else:
             effective_mamba_size = size + pre_alloc_size
+        # TODO: Support PP
+        self.start_layer = 0
+        self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
