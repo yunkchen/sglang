@@ -47,6 +47,99 @@ class SetKAndS:
         _set_k_and_s_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
 
+class GetKAndS:
+    """Inverse of :class:`SetKAndS`: gather per-token
+    ``(k_nope_fp8, k_rope_bf16, scale_k_nope_ue8m0)`` from a paged byte
+    buffer for CPU offload."""
+
+    @classmethod
+    def execute(cls, pool, buf, loc) -> NopeFp8RopeBf16Pack:
+        return cls.torch(pool, buf, loc)
+
+    @classmethod
+    def torch(cls, pool, buf, loc) -> NopeFp8RopeBf16Pack:
+        return _get_k_and_s_torch(
+            buf=buf,
+            loc=loc,
+            page_size=pool.page_size,
+            nope_dim=pool.qk_nope_head_dim,
+            rope_dim=pool.qk_rope_head_dim,
+            quantize_block_size=pool.quantize_block_size,
+            scale_pad=pool.scale_pad,
+            rope_storage_dtype=pool.rope_storage_dtype,
+        )
+
+
+def _get_k_and_s_torch(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+    nope_dim: int,
+    rope_dim: int,
+    quantize_block_size: int,
+    scale_pad: int,
+    rope_storage_dtype: torch.dtype,
+) -> NopeFp8RopeBf16Pack:
+    rope_itemsize = rope_storage_dtype.itemsize
+    nope_rope_bytes = nope_dim + rope_dim * rope_itemsize
+    scale_dim = nope_dim // quantize_block_size
+    padded_scale = scale_dim + scale_pad
+    s_offset_nbytes_in_page = page_size * nope_rope_bytes
+
+    assert buf.dtype == torch.uint8
+    assert loc.dtype in (torch.int64, torch.int32), f"{loc.dtype=}"
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    # nope_dim must align to rope element size or the rope view-offset math below breaks.
+    assert nope_dim % rope_itemsize == 0, f"{nope_dim=} {rope_itemsize=}"
+
+    num_pages, buf_numel_per_page = buf.shape
+    n_tokens = loc.shape[0]
+    device = buf.device
+
+    flat_uint8 = buf.view(torch.uint8).flatten()
+    flat_fp8 = buf.view(fp8_dtype).flatten()
+    flat_rope = buf.view(rope_storage_dtype).flatten()
+
+    loc_i64 = loc.to(torch.int64)
+    loc_page = loc_i64 // page_size
+    loc_slot = loc_i64 % page_size
+
+    nope_off_bytes = loc_page * buf_numel_per_page + loc_slot * nope_rope_bytes
+    nope_idx = nope_off_bytes[:, None] + torch.arange(
+        nope_dim, dtype=torch.int64, device=device
+    )[None, :]
+    k_nope_bytes = (
+        flat_fp8[nope_idx.flatten()].view(n_tokens, nope_dim).contiguous()
+    )
+
+    rope_off_elems = (
+        loc_page * (buf_numel_per_page // rope_itemsize)
+        + loc_slot * (nope_rope_bytes // rope_itemsize)
+        + (nope_dim // rope_itemsize)
+    )
+    rope_idx = rope_off_elems[:, None] + torch.arange(
+        rope_dim, dtype=torch.int64, device=device
+    )[None, :]
+    k_rope = flat_rope[rope_idx.flatten()].view(n_tokens, rope_dim).contiguous()
+
+    s_off_bytes = (
+        loc_page * buf_numel_per_page
+        + s_offset_nbytes_in_page
+        + loc_slot * padded_scale
+    )
+    s_idx = s_off_bytes[:, None] + torch.arange(
+        scale_dim, dtype=torch.int64, device=device
+    )[None, :]
+    scale = flat_uint8[s_idx.flatten()].view(n_tokens, scale_dim).contiguous()
+
+    return NopeFp8RopeBf16Pack(
+        k_nope_fp8=k_nope_bytes,
+        k_rope_bf16=k_rope,
+        scale_k_nope_ue8m0=scale,
+    )
+
+
 def _set_k_and_s_triton(
     buf: torch.Tensor,
     loc: torch.Tensor,
