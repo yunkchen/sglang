@@ -172,7 +172,6 @@ class DeepSeekV4SingleKVPool(KVCache):
             ]
 
         loc = indices.to(self.device, dtype=torch.int64)
-        torch.cuda.synchronize()
         layers_cpu = []
         for layer_id in range(self.layer_num):
             pack = index_buf_accessor_v4.GetKAndS.execute(
@@ -189,7 +188,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                     ),
                 }
             )
-        torch.cuda.synchronize()
+        
         return layers_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices: torch.Tensor):
@@ -197,7 +196,6 @@ class DeepSeekV4SingleKVPool(KVCache):
             return
 
         loc = indices.to(self.device, dtype=torch.int64)
-        torch.cuda.synchronize()
         for layer_id, layer_cpu in enumerate(kv_cache_cpu):
             if layer_cpu["k_nope_fp8"] is None:
                 continue
@@ -218,7 +216,6 @@ class DeepSeekV4SingleKVPool(KVCache):
                 loc=loc,
                 nope_fp8_rope_bf16_pack=pack,
             )
-        torch.cuda.synchronize()
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
@@ -465,7 +462,6 @@ class DeepSeekV4IndexerPool(KVCache):
             ]
 
         loc = indices.to(self.device, dtype=torch.int64)
-        torch.cuda.synchronize()
         layers_cpu = []
         for layer_id in range(self.layer_num):
             index_k, index_k_scale = self._gather_per_token_index_k_scale(
@@ -477,7 +473,6 @@ class DeepSeekV4IndexerPool(KVCache):
                     "index_k_scale": index_k_scale.to("cpu", non_blocking=True),
                 }
             )
-        torch.cuda.synchronize()
         return layers_cpu
 
     def _scatter_per_token_index_k_scale(
@@ -522,7 +517,6 @@ class DeepSeekV4IndexerPool(KVCache):
             return
 
         loc = indices.to(self.device, dtype=torch.int64)
-        torch.cuda.synchronize()
         for layer_id, layer_cpu in enumerate(kv_cache_cpu):
             if layer_cpu["index_k"] is None:
                 continue
@@ -533,7 +527,6 @@ class DeepSeekV4IndexerPool(KVCache):
             self._scatter_per_token_index_k_scale(
                 layer_id, loc, index_k, index_k_scale
             )
-        torch.cuda.synchronize()
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -1037,20 +1030,30 @@ class DeepSeekV4TokenToKVPool(KVCache):
             "valid_swa_mask": valid_swa_mask.detach().to("cpu", copy=True),
         }
 
-        for pool in self.compress_state_pools:
-            if pool is None:
+        state_locs_by_ratio: dict[int, torch.Tensor] = {}
+        for ratio, cs_pool, idx_pool in zip(
+            self.compression_ratios,
+            self.compress_state_pools,
+            self.indexer_compress_state_pools,
+        ):
+            if cs_pool is None and idx_pool is None:
                 result["compress_state"].append(None)
-                continue
-            state_locs = pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
-            result["compress_state"].append(pool.get_cpu_copy(state_locs))
-
-        for pool in self.indexer_compress_state_pools:
-            if pool is None:
                 result["indexer_compress_state"].append(None)
                 continue
-            state_locs = pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
-            result["indexer_compress_state"].append(pool.get_cpu_copy(state_locs))
+            if ratio not in state_locs_by_ratio:
+                ref_pool = cs_pool if cs_pool is not None else idx_pool
+                state_locs_by_ratio[ratio] = (
+                    ref_pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
+                )
+            state_locs = state_locs_by_ratio[ratio]
+            result["compress_state"].append(
+                cs_pool.get_cpu_copy(state_locs) if cs_pool is not None else None
+            )
+            result["indexer_compress_state"].append(
+                idx_pool.get_cpu_copy(state_locs) if idx_pool is not None else None
+            )
 
+        torch.cuda.synchronize()
         return result
 
     def load_cpu_copy(self, kv_cache_cpu, indices: torch.Tensor):
@@ -1068,20 +1071,28 @@ class DeepSeekV4TokenToKVPool(KVCache):
         self.c128_kv_pool.load_cpu_copy(kv_cache_cpu["c128"], c128_indices)
         self.c4_indexer_kv_pool.load_cpu_copy(kv_cache_cpu["c4_indexer"], c4_indices)
 
-        for pool, layer_state in zip(
-            self.compress_state_pools, kv_cache_cpu["compress_state"]
-        ):
-            if pool is None or layer_state is None:
-                continue
-            state_locs = pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
-            pool.load_cpu_copy(layer_state, state_locs)
-
-        for pool, layer_state in zip(
+        state_locs_by_ratio: dict[int, torch.Tensor] = {}
+        for ratio, cs_pool, idx_pool, cs_state, idx_state in zip(
+            self.compression_ratios,
+            self.compress_state_pools,
             self.indexer_compress_state_pools,
+            kv_cache_cpu["compress_state"],
             kv_cache_cpu["indexer_compress_state"],
         ):
-            if pool is None or layer_state is None:
+            cs_active = cs_pool is not None and cs_state is not None
+            idx_active = idx_pool is not None and idx_state is not None
+            if not (cs_active or idx_active):
                 continue
-            state_locs = pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
-            pool.load_cpu_copy(layer_state, state_locs)
+            if ratio not in state_locs_by_ratio:
+                ref_pool = cs_pool if cs_active else idx_pool
+                state_locs_by_ratio[ratio] = (
+                    ref_pool.translate_from_swa_loc_to_state_loc(valid_swa_locs)
+                )
+            state_locs = state_locs_by_ratio[ratio]
+            if cs_active:
+                cs_pool.load_cpu_copy(cs_state, state_locs)
+            if idx_active:
+                idx_pool.load_cpu_copy(idx_state, state_locs)
+
+        torch.cuda.synchronize()
 
