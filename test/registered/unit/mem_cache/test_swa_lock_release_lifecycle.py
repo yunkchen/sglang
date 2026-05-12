@@ -461,6 +461,131 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
 
         tree.sanity_check()
 
+    # -- sgl-project/sglang#24153 regression coverage ----------------------
+    #
+    # Two independent paths produced
+    #   AssertionError: dec_lock_ref on node with node.swa_lock_ref=0
+    # under long-context SWA workloads:
+    #
+    #   Bug B — disagg-decode's `_match_prefix_and_lock` captured the inc
+    #           result but discarded `swa_uuid_for_lock`, so the rollback
+    #           `dec_lock_ref` walk had nothing to stop on and overshot the
+    #           anchor.
+    #   Bug A — `_compact_single_child_chain` could overwrite an active
+    #           anchor's UUID with a stale UUID from the merged child,
+    #           leaving holders of the active UUID unable to locate it.
+    #
+    # The next four tests pin both directions of each fix.
+
+    def test_dec_lock_ref_with_swa_uuid_balanced(self):
+        """Canonical inc/dec pair with UUID threaded — the pattern that
+        disagg-decode's rollback path must follow."""
+        tree, allocator, _ = _build_tree(sliding_window_size=4)
+        leaf = _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        inc_res = tree.inc_lock_ref(leaf)
+        swa_uuid = inc_res.swa_uuid_for_lock
+        self.assertIsNotNone(swa_uuid)
+
+        tree.dec_lock_ref(leaf, DecLockRefParams(swa_uuid_for_lock=swa_uuid))
+
+        self.assertEqual(leaf.full_lock_ref, 0)
+        self.assertEqual(leaf.swa_lock_ref, 0)
+        self.assertEqual(tree.full_protected_size_, 0)
+        self.assertEqual(tree.swa_protected_size_, 0)
+        tree.sanity_check()
+
+    def test_dec_lock_ref_without_swa_uuid_overshoots_anchored_prefix(self):
+        """Regression guard: when the inc walk set an anchor (prefix >=
+        sliding window), the matching dec MUST receive that UUID. Calling
+        dec_lock_ref without it walks past the anchor and trips the
+        swa_lock_ref assertion. This is exactly the failure mode disagg
+        decode hit before Fix 1."""
+        tree, allocator, _ = _build_tree(sliding_window_size=4)
+        leaf = _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        inc_res = tree.inc_lock_ref(leaf)
+        self.assertIsNotNone(inc_res.swa_uuid_for_lock)
+
+        with self.assertRaisesRegex(AssertionError, "swa_lock_ref"):
+            tree.dec_lock_ref(leaf)
+
+    def _build_single_child_chain_for_compact(self):
+        """Build root -> A -> B -> leaf3, single-child chain through A and B,
+        with sliding_window=10 so inc_lock_ref(leaf3) anchors at A
+        (4+4+4 tokens reaches the window only at A)."""
+        tree, allocator, _ = _build_tree(sliding_window_size=10)
+        _insert_chain(tree, allocator, [1, 2, 3, 4])
+        _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
+        leaf3 = _insert_chain(tree, allocator, list(range(1, 13)))
+
+        B = leaf3.parent
+        A = B.parent
+        self.assertIs(A.parent, tree.root_node)
+        self.assertEqual(len(A.children), 1)
+        self.assertEqual(len(B.children), 1)
+        self.assertEqual(len(leaf3.children), 0)
+        return tree, allocator, A, B, leaf3
+
+    def test_compact_preserves_active_swa_uuid(self):
+        """Bug A guard: when `node` holds an active SWA anchor and `child`
+        carries a stale UUID, compact must refuse to merge. Without the
+        guard, `node.swa_uuid` is overwritten with the stale value, and the
+        active holder's later dec_lock_ref overshoots."""
+        tree, allocator, A, B, leaf3 = self._build_single_child_chain_for_compact()
+
+        # Stale UUID on B from a hypothetical earlier finished request.
+        stale_uuid = -999
+        B.swa_uuid = stale_uuid
+
+        inc_res = tree.inc_lock_ref(leaf3)
+        active_uuid = inc_res.swa_uuid_for_lock
+        self.assertEqual(A.swa_uuid, active_uuid)
+        self.assertIsNotNone(active_uuid)
+        self.assertNotEqual(active_uuid, stale_uuid)
+        self.assertEqual(A.swa_lock_ref, 1)
+        self.assertEqual(B.swa_lock_ref, 1)
+
+        # Trigger compact directly. Pre-fix this would merge A+B and
+        # clobber active_uuid; post-fix the merge is refused.
+        tree._compact_single_child_chain(A)
+
+        self.assertEqual(len(A.children), 1)
+        self.assertIs(next(iter(A.children.values())), B)
+        self.assertEqual(A.swa_uuid, active_uuid)
+        self.assertEqual(B.swa_uuid, stale_uuid)
+
+        # Release must complete cleanly.
+        tree.dec_lock_ref(
+            leaf3, DecLockRefParams(swa_uuid_for_lock=active_uuid)
+        )
+        tree.sanity_check()
+
+    def test_compact_merges_when_only_stale_uuids(self):
+        """Regression guard for the common case: when neither `node` nor
+        `child` is locked, compact still proceeds and the merged node ends
+        up with `child`'s UUID (matches the prior behaviour)."""
+        tree, allocator, A, B, leaf3 = self._build_single_child_chain_for_compact()
+
+        # Both UUIDs stale, no active locks anywhere.
+        A.swa_uuid = -111
+        B.swa_uuid = -222
+        self.assertEqual(A.swa_lock_ref, 0)
+        self.assertEqual(B.swa_lock_ref, 0)
+
+        original_a_value_len = len(A.value)
+        original_b_value_len = len(B.value)
+
+        tree._compact_single_child_chain(A)
+
+        # A and B merged: A now spans both keys and points directly at leaf3.
+        self.assertEqual(len(A.children), 1)
+        self.assertIs(next(iter(A.children.values())), leaf3)
+        self.assertIs(leaf3.parent, A)
+        self.assertEqual(len(A.value), original_a_value_len + original_b_value_len)
+        # Child's stale UUID migrated to A (legacy behaviour for stale UUIDs).
+        self.assertEqual(A.swa_uuid, -222)
+
 
 if __name__ == "__main__":
     unittest.main()

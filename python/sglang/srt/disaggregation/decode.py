@@ -56,7 +56,11 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -436,10 +440,27 @@ class DecodePreallocQueue:
         )
         prefix_indices = result.device_indices
         last_device_node = result.last_device_node
-        # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(last_device_node)
+        # Always lock to match aggregated scheduling behavior. Capture
+        # swa_uuid_for_lock so the paired dec_lock_ref can stop at the SWA
+        # anchor; without it the release walk overshoots and hits an
+        # un-incremented node (sgl-project/sglang#24153).
+        inc_result = self.tree_cache.inc_lock_ref(last_device_node)
+        req.swa_uuid_for_lock = inc_result.swa_uuid_for_lock
 
         return prefix_indices, len(prefix_indices)
+
+    def _release_match_lock(self, req: Req) -> None:
+        """Release the lock acquired by `_match_prefix_and_lock` on rollback.
+
+        Must thread `swa_uuid_for_lock` so the SWA-side walk stops at the
+        anchor; otherwise the dec overshoots and trips the swa_lock_ref
+        assertion (sgl-project/sglang#24153).
+        """
+        self.tree_cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        req.swa_uuid_for_lock = None
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -774,11 +795,11 @@ class DecodePreallocQueue:
                 > allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_match_lock(decode_req.req)
                 break
             if required_tokens_for_request > allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_match_lock(decode_req.req)
                 break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)

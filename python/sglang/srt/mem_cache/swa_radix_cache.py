@@ -968,9 +968,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
-        # FIXME(ispobock): drifts retract pool accounting (commit 6348cb506);
-        # also overwrites active swa_uuid when window > page_size. Off by
-        # default via SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.
+        # FIXME(ispobock): drifts retract pool accounting (commit 6348cb506).
+        # Off by default via SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.
         while len(node.children) == 1:
             child = next(iter(node.children.values()))
             if len(child.children) == 0:
@@ -984,6 +983,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 child.swa_tombstone != node.swa_tombstone
                 or child.full_lock_ref != node.full_lock_ref
                 or child.swa_lock_ref != node.swa_lock_ref
+            ):
+                break
+
+            # Refuse to merge when doing so would clobber an active SWA anchor
+            # (sgl-project/sglang#24153). The lock-count equality above does
+            # NOT preclude an active anchor on `node`: a request anchored at
+            # `node` contributes +1 to both `child.swa_lock_ref` and
+            # `node.swa_lock_ref` (inc walks leaf->root). Overwriting
+            # `node.swa_uuid` with `child.swa_uuid` here would leave that
+            # request's stored UUID un-locatable in the tree; its later
+            # `dec_lock_ref` would walk past the anchor and assert.
+            if (
+                node.swa_uuid is not None
+                and child.swa_uuid is not None
+                and node.swa_uuid != child.swa_uuid
+                and (node.swa_lock_ref > 0 or child.swa_lock_ref > 0)
             ):
                 break
 
